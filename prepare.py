@@ -1,24 +1,23 @@
 """
 One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Reads .md documents from a local data directory and trains a BPE tokenizer.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                        # full prep (tokenizer training)
+    python prepare.py --data-dir ./data      # specify data directory
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data is read from ./data (default). Tokenizer is stored in ~/.cache/autoresearch/.
 """
 
 import os
 import sys
 import time
 import math
+import json
+import random
 import argparse
 import pickle
-from multiprocessing import Pool
 
-import requests
-import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
 import torch
@@ -36,13 +35,13 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 # ---------------------------------------------------------------------------
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
+DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 VOCAB_SIZE = 8192
+VAL_RATIO = 0.1
+SPLIT_SEED = 42
+CHUNK_SIZE = 10_000
+CHUNK_OVERLAP = 1_000
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -51,94 +50,89 @@ SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
 
 # ---------------------------------------------------------------------------
-# Data download
+# Data helpers
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+def list_md_files(data_dir=DEFAULT_DATA_DIR):
+    """Return sorted list of all .md file paths under data_dir."""
+    md_files = []
+    for root, _dirs, files in os.walk(data_dir):
+        for f in files:
+            if f.endswith(".md"):
+                md_files.append(os.path.join(root, f))
+    md_files.sort()
+    return md_files
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+def _get_split_groups(data_dir):
+    """Group .md files by their immediate parent directory for independent splitting."""
+    groups = {}
+    for md_path in list_md_files(data_dir):
+        parent = os.path.dirname(md_path)
+        group_key = os.path.relpath(parent, data_dir).split(os.sep)[0]
+        groups.setdefault(group_key, []).append(md_path)
+    return groups
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+
+def get_train_val_split(data_dir=DEFAULT_DATA_DIR):
+    """Return (train_files, val_files). Persists split to JSON for consistency."""
+    split_path = os.path.join(data_dir, "train_val_split.json")
+    if os.path.exists(split_path):
+        with open(split_path, "r") as f:
+            saved = json.load(f)
+        return saved["train"], saved["val"]
+
+    groups = _get_split_groups(data_dir)
+    train_files, val_files = [], []
+    rng = random.Random(SPLIT_SEED)
+    for group_key in sorted(groups):
+        files = sorted(groups[group_key])
+        rng.shuffle(files)
+        n_val = max(1, int(len(files) * VAL_RATIO))
+        val_files.extend(files[:n_val])
+        train_files.extend(files[n_val:])
+
+    train_files.sort()
+    val_files.sort()
+    with open(split_path, "w") as f:
+        json.dump({"train": train_files, "val": val_files}, f, indent=2)
+    print(f"Data: created train/val split ({len(train_files)} train, {len(val_files)} val) at {split_path}")
+    return train_files, val_files
+
+
+def chunk_document(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Yield overlapping chunks from a document."""
+    if len(text) <= chunk_size:
+        yield text
         return
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        yield text[start:end]
+        if end >= len(text):
+            break
+        start = end - overlap
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
+def text_iterator(data_dir=DEFAULT_DATA_DIR, max_chars=1_000_000_000, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Yield document chunks from training split .md files."""
+    train_files, _ = get_train_val_split(data_dir)
     nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+    for filepath in train_files:
+        with open(filepath, "r", encoding="utf-8") as f:
+            text = f.read()
+        for chunk in chunk_document(text, chunk_size, overlap):
+            nchars += len(chunk)
+            yield chunk
+            if nchars >= max_chars:
+                return
 
 
-def train_tokenizer():
+def train_tokenizer(data_dir=DEFAULT_DATA_DIR):
     """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
     token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
@@ -149,18 +143,18 @@ def train_tokenizer():
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+    train_files, val_files = get_train_val_split(data_dir)
+    if len(train_files) == 0 or len(val_files) == 0:
+        print("Tokenizer: need .md files in data directory for both train and val splits.")
         sys.exit(1)
 
     # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
+    print(f"Tokenizer: training BPE tokenizer on {len(train_files)} train files...")
     t0 = time.time()
 
     tokenizer = rustbpe.Tokenizer()
     vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    tokenizer.train_from_iterator(text_iterator(data_dir), vocab_size_no_special, pattern=SPLIT_PATTERN)
 
     # Build tiktoken encoding from trained merges
     pattern = tokenizer.get_pattern()
@@ -251,29 +245,29 @@ def get_token_bytes(device="cpu"):
         return torch.load(f, map_location=device)
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
+def _document_batches(split, data_dir=DEFAULT_DATA_DIR, tokenizer_batch_size=128,
+                      chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Infinite iterator over document chunk batches from .md files."""
+    train_files, val_files = get_train_val_split(data_dir)
+    file_paths = train_files if split == "train" else val_files
+    assert len(file_paths) > 0, f"No {split} files found. Check data directory."
     epoch = 1
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        batch = []
+        for filepath in file_paths:
+            with open(filepath, "r", encoding="utf-8") as f:
+                text = f.read()
+            for chunk in chunk_document(text, chunk_size, overlap):
+                batch.append(chunk)
+                if len(batch) >= tokenizer_batch_size:
+                    yield batch, epoch
+                    batch = []
+        if batch:
+            yield batch, epoch
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(tokenizer, B, T, split, data_dir=DEFAULT_DATA_DIR, buffer_size=1000):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
@@ -282,7 +276,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     """
     assert split in ["train", "val"]
     row_capacity = T + 1
-    batches = _document_batches(split)
+    batches = _document_batches(split, data_dir=data_dir)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     epoch = 1
@@ -370,20 +364,19 @@ def evaluate_bpb(model, tokenizer, batch_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR, help="Directory containing .md files in subdirectories")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
+    print(f"Data directory: {args.data_dir}")
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    # Step 1: Create train/val split
+    train_files, val_files = get_train_val_split(args.data_dir)
+    print(f"Data: {len(train_files)} train files, {len(val_files)} val files")
     print()
 
     # Step 2: Train tokenizer
-    train_tokenizer()
+    train_tokenizer(args.data_dir)
     print()
     print("Done! Ready to train.")
